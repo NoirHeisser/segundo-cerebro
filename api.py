@@ -32,9 +32,9 @@ SYSTEM_PROMPT_DEFAULT = (
     "- Siempre sugieres conexiones entre notas y papers que el usuario quizás no vio\n"
     "- Identificas vacíos en la investigación y los señalas\n"
     "- Propones preguntas de investigación concretas\n"
-    "- Cuando citas un paper de Zotero, incluyes autores y año\n"
+    "- Cuando citas un paper de Zotero, usa SOLO el titulo exacto que aparece en PAPERS DE ZOTERO. NUNCA inventes autores, años o detalles que no esten en el contexto\n"
     "- Cuando usas una nota de Obsidian, mencionas su nombre\n"
-    "- Si hay contradicción entre fuentes, lo señalas explícitamente\n"
+    "- Si hay contradiccion entre fuentes, lo señalas explicitamente\n""- Si la informacion no esta en el contexto proporcionado, dilo explicitamente en vez de inventar\n"
     "- Al final de cada respuesta, sugieres 1-2 preguntas de seguimiento relevantes"
 )
 
@@ -76,7 +76,9 @@ TRADUCCION_QUERY = {
 
 # ── Modelos cargados una sola vez al arrancar ─────────────────────────────────
 client_chroma = chromadb.PersistentClient(path=DB_PATH)
-collection    = client_chroma.get_or_create_collection(COLLECTION_NAME)
+
+def get_collection():
+    return client_chroma.get_or_create_collection(COLLECTION_NAME)
 embed_model   = SentenceTransformer("all-MiniLM-L6-v2")
 
 client_llm = OpenAI(
@@ -153,20 +155,21 @@ async def _zotero_get(query: str, limit: int, headers_web: dict) -> list:
     return []
 
 
-async def zotero_buscar(pregunta: str, limit: int = 5) -> list:
-    headers_web = {"Zotero-API-Key": ZOTERO_API_KEY, "Zotero-API-Version": "3"}
-    queries     = construir_queries_zotero(pregunta)
-    tareas      = [_zotero_get(q, limit, headers_web) for q in queries]
-    resultados  = await asyncio.gather(*tareas)
+def zotero_buscar_chromadb(pregunta: str, limit: int = 8) -> list:
+    try:
+        col_zotero = client_chroma.get_collection('zotero')
+        embedding  = embed_model.encode(pregunta).tolist()
+        resultados = col_zotero.query(query_embeddings=[embedding], n_results=limit)
+        items = []
+        for doc, meta in zip(resultados['documents'][0], resultados['metadatas'][0]):
+            items.append({'_chromadb': True, 'documento': doc, 'meta': meta})
+        return items
+    except Exception as e:
+        print(f'Error ChromaDB zotero: {e}')
+        return []
 
-    vistos = {}
-    for lista in resultados:
-        for item in lista:
-            key = item.get("key") or item.get("data", {}).get("key")
-            if key and key not in vistos:
-                vistos[key] = item
-
-    return list(vistos.values())[:limit]
+async def zotero_buscar(pregunta: str, limit: int = 8) -> list:
+    return zotero_buscar_chromadb(pregunta, limit)
 
 
 def formatear_item_zotero(item: dict) -> tuple[str, str]:
@@ -207,12 +210,12 @@ def necesita_zotero(pregunta: str, n_notas_encontradas: int) -> bool:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "notas_indexadas": collection.count()}
+    return {"status": "ok", "notas_indexadas": get_collection().count()}
 
 
 @app.get("/carpetas")
 def listar_carpetas():
-    datos    = collection.get(include=["metadatas"])
+    datos    = get_collection().get(include=["metadatas"])
     carpetas = sorted({m.get("carpeta", ".") for m in datos["metadatas"]})
     return {"carpetas": ["Todas"] + carpetas}
 
@@ -229,7 +232,7 @@ async def chat(req: ChatRequest):
     if req.carpeta and req.carpeta != "Todas":
         where = {"carpeta": req.carpeta}
 
-    resultados = collection.query(
+    resultados = get_collection().query(
         query_embeddings=[embedding],
         n_results=3,
         where=where,
